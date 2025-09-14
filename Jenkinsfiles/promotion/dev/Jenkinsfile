@@ -1,0 +1,82 @@
+pipeline {
+  agent any
+
+  triggers {
+    GenericTrigger(
+      genericVariables: [
+        [key: 'DOCKER_TAG', value: '$.push_data.tag', defaultValue: '', regexpFilter: ''],
+        [key: 'DOCKER_REPO', value: '$.repository.repo_name', defaultValue: '', regexpFilter: ''],
+        [key: 'SERVICE_NAME', value: '$.repository.name', defaultValue: '', regexpFilter: ''],
+      ],
+      causeString: 'Triggered by Docker Hub webhook: $DOCKER_REPO_NAME:$DOCKER_TAG',
+      token: 'pingpong-cd-dev',
+      printContributedVariables: true,
+      printPostContent: false,
+      silentResponse: true
+    )
+  }
+
+  options {
+    disableConcurrentBuilds()
+  }
+
+  stages {
+    stage('Validate payload') {
+      steps {
+        script {
+          if (!env.DOCKER_REPO?.trim()) error("Missing DOCKER_REPO from payload.")
+          if (!env.DOCKER_TAG?.trim())  error("Missing DOCKER_TAG from payload.")
+          if (!env.SERVICE_NAME?.trim()) error("Missing SERVICE_NAME from payload.")
+
+          echo "Webhook: repo=${env.DOCKER_REPO}, image=${env.SERVICE_NAME}, tag=${env.DOCKER_TAG}"
+        }
+      }
+    }
+
+    stage('Checkout') {
+      steps {
+        cleanWs()
+        checkout([
+          $class: 'GitSCM',
+          branches: [[name: "*/main"]],
+          userRemoteConfigs: [[
+            url: 'https://github.com/daoquocquyen/pingpong-cicd.git'
+          ]]
+        ])
+      }
+    }
+
+    stage('Checkout config repo') {
+      steps {
+        dir('pingpong-gitops-config') {
+          checkout([
+            $class: 'GitSCM',
+            branches: [[name: "*/main"]],
+            userRemoteConfigs: [[
+              url: 'https://github.com/daoquocquyen/pingpong-gitops-config.git'
+            ]]
+          ])
+        }
+      }
+    }
+
+    stage('Bump & PR') {
+      environment {
+        GH_TOKEN = credentials('gh-pat') // Secret text credential
+      }
+      steps {
+        script {
+          env.OVERLAY_DIR = "pingpong-gitops-config/${env.SERVICE_NAME}/overlays/dev"
+        }
+        sh '''
+          ./scripts/bump-image-version.sh "${OVERLAY_DIR}" "${DOCKER_REPO}" "${DOCKER_TAG}"
+        '''
+      }
+    }
+  }
+
+  post {
+    success { echo "Bump + PR created for ${env.DOCKER_REPO}:${env.DOCKER_TAG}" }
+    failure { echo "Pipeline failed for ${env.DOCKER_REPO}:${env.DOCKER_TAG}" }
+  }
+}

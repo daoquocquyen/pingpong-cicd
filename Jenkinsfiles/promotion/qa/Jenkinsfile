@@ -1,0 +1,100 @@
+pipeline {
+  agent any
+  options { disableConcurrentBuilds() }
+
+  parameters {
+    string(name: 'BASELINE_SHA', defaultValue: '', description: 'GitOps commit SHA that passed dev cd-tests (baseline). Required.')
+  }
+
+  environment {
+    GH_TOKEN = credentials('gh-pat')
+    GITOPS_REPO = 'https://github.com/daoquocquyen/pingpong-gitops-config.git'
+  }
+
+  stages {
+    stage('Validate params') {
+      steps {
+        script {
+          if (!params.BASELINE_SHA?.trim()) error 'BASELINE_SHA is required.'
+          echo "Baseline=${params.BASELINE_SHA}"
+        }
+      }
+    }
+
+    stage('Checkout GitOps at baseline') {
+      steps {
+        cleanWs()
+        dir('gitops') {
+          checkout([$class: 'GitSCM', branches: [[name: '*/main']], userRemoteConfigs: [[url: env.GITOPS_REPO]]])
+          sh '''
+            set -eu
+            git fetch origin "$BASELINE_SHA" --quiet || true
+            if git cat-file -e "$BASELINE_SHA" 2>/dev/null; then
+              git checkout "$BASELINE_SHA"
+            else
+              echo "Baseline SHA not present locally; attempting to fetch by SHA from origin"
+              git fetch origin "$BASELINE_SHA":"refs/tmp/baseline" --quiet
+              git checkout "$BASELINE_SHA"
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Resolve versions') {
+      steps {
+        script {
+          // Read tags from dev overlays at baseline and store in env
+          env.PING_TAG = sh(returnStdout: true, script: '''awk '/name: *daoquocquyen\\/ping/{f=1} f&&/newTag:/{print $2; exit}' gitops/ping/overlays/dev/kustomization.yaml''').trim()
+          env.PONG_TAG = sh(returnStdout: true, script: '''awk '/name: *daoquocquyen\\/pong/{f=1} f&&/newTag:/{print $2; exit}' gitops/pong/overlays/dev/kustomization.yaml''').trim()
+          echo "Versions to promote: ping=${env.PING_TAG}, pong=${env.PONG_TAG}"
+        }
+      }
+    }
+
+    stage('Create QA branch + update overlays') {
+      steps {
+        dir('gitops') {
+          script { env.BRANCH_NAME = "promote/qa/${params.BASELINE_SHA.take(7)}-${new Date().format('yyyyMMddHHmmss')}" }
+          sh '''
+            set -eu
+            git checkout -B "$BRANCH_NAME"
+            # Update QA kustomization newTag values using env-provided tags
+            sed -i '/name: *daoquocquyen\\/ping/{n;s|newTag:.*|newTag: '"$PING_TAG"'|}' ping/overlays/qa/kustomization.yaml
+            sed -i '/name: *daoquocquyen\\/pong/{n;s|newTag:.*|newTag: '"$PONG_TAG"'|}' pong/overlays/qa/kustomization.yaml
+            git status --porcelain
+            # Ensure git identity is set for CI commits
+            git config user.email "${GIT_USER_EMAIL:-jenkins-bot@localhost}"
+            git config user.name  "${GIT_USER_NAME:-Jenkins-bot}"
+            git add ping/overlays/qa/kustomization.yaml pong/overlays/qa/kustomization.yaml
+            git commit -m "promote(qa): ping->${PING_TAG}, pong->${PONG_TAG} from baseline ${BASELINE_SHA}"
+          '''
+        }
+      }
+    }
+
+    stage('Push branch + Open PR') {
+      steps {
+        dir('gitops') {
+          sh '''
+            set -eu
+            export GITHUB_TOKEN="$GH_TOKEN"
+            git remote set-url origin "https://jenkins-bot:${GH_TOKEN}@github.com/daoquocquyen/pingpong-gitops-config.git"
+            git push -u origin "$BRANCH_NAME"
+            SHORT_SHA=$(echo "$BASELINE_SHA" | cut -c1-7)
+            gh pr create \
+              --title "Promote to QA: ${SHORT_SHA}" \
+              --body "Promote from dev baseline ${BASELINE_SHA}." \
+              --base main \
+              --head "$BRANCH_NAME"
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo 'Promotion PR for QA created.' }
+    failure { echo 'Promotion to QA failed.' }
+  }
+}

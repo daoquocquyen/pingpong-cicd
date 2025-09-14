@@ -1,0 +1,72 @@
+pipeline {
+  agent any
+  options { disableConcurrentBuilds() }
+
+  parameters { string(name: 'BASELINE_SHA', defaultValue: '', description: 'GitOps commit SHA to verify (prod).') }
+  environment { GITOPS_REPO = 'https://github.com/daoquocquyen/pingpong-gitops-config.git' }
+
+  stages {
+    stage('Validate input') {
+      steps {
+        script { if (!(params.BASELINE_SHA ?: '')) { echo 'Missing BASELINE_SHA'; currentBuild.result = 'NOT_BUILT' } }
+      }
+    }
+    stage('Checkout baseline') {
+      when { expression { return currentBuild.result == null } }
+      steps {
+        dir('gitops') {
+          checkout([$class: 'GitSCM', branches: [[name: '*/main']], userRemoteConfigs: [[ url: env.GITOPS_REPO ]]])
+          sh '''
+            set -eu
+            if ! git cat-file -e "$BASELINE_SHA" 2>/dev/null; then
+              git fetch origin "$BASELINE_SHA":"refs/tmp/baseline" --quiet || true
+            fi
+            git checkout "$BASELINE_SHA"
+          '''
+        }
+      }
+    }
+    stage('Record baseline') {
+      when { expression { return currentBuild.result == null } }
+      steps {
+        script {
+          writeFile file: 'baseline.txt', text: params.BASELINE_SHA + "\n"
+          def d = currentBuild.description ?: ''
+          currentBuild.description = (d ? d + ' | ' : '') + "baseline=${params.BASELINE_SHA}, env=prod"
+          archiveArtifacts artifacts: 'baseline.txt', fingerprint: true, onlyIfSuccessful: false
+        }
+      }
+    }
+    stage('Argo CD wait for sync/health') {
+      when { expression { return currentBuild.result == null } }
+      steps { sh '''
+        argocd app wait pingpong-prod --sync --health --timeout 300 --server host.docker.internal:8443 --insecure --grpc-web
+        argocd app get  pingpong-prod --server host.docker.internal:8443 --insecure --grpc-web
+      ''' }
+    }
+    stage('Prod synthetic checks') {
+      when { expression { return currentBuild.result == null } }
+      steps { sh '''
+        set -eu
+        for i in 1 2 3 4 5; do
+          curl -sSf -H "Host: ping.prod.local" http://host.docker.internal:8888/api/ping | tee prod-ping-$i.txt
+          grep -q 'pong-prod' prod-ping-$i.txt
+        done
+        curl -sSf -H "Host: ping.prod.local" http://host.docker.internal:8888/health | tee prod-health.json
+        grep -q 'UP' prod-health.json
+      ''' }
+    }
+  }
+  post {
+    success {
+      echo '[PROD] Sending notification to prod-team: SUCCESS'
+    }
+    failure {
+      echo '[PROD] Sending notification to prod-team: FAILURE'
+    }
+    unstable {
+      echo '[PROD] Sending notification to prod-team: UNSTABLE'
+    }
+  }
+}
+

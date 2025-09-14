@@ -1,0 +1,158 @@
+pipeline {
+  agent any
+  options { disableConcurrentBuilds() }
+
+  parameters {
+    string(name: 'BASELINE_SHA', defaultValue: '', description: 'GitOps commit SHA that passed QA tests (baseline). Required.')
+  }
+
+  environment {
+    GH_TOKEN = credentials('gh-pat')
+    GITOPS_REPO = 'https://github.com/daoquocquyen/pingpong-gitops-config.git'
+    PING_REPO_URL = 'https://github.com/daoquocquyen/ping.git'
+    PONG_REPO_URL = 'https://github.com/daoquocquyen/pong.git'
+  }
+
+  stages {
+    stage('Validate params') {
+      steps {
+        script {
+          if (!params.BASELINE_SHA?.trim()) error 'BASELINE_SHA is required.'
+          echo "Baseline=${params.BASELINE_SHA}"
+        }
+      }
+    }
+
+    stage('Checkout GitOps at baseline') {
+      steps {
+        cleanWs()
+        dir('gitops') {
+          checkout([$class: 'GitSCM', branches: [[name: '*/main']], userRemoteConfigs: [[url: env.GITOPS_REPO]]])
+          sh '''
+            set -eu
+            git fetch origin "$BASELINE_SHA" --quiet || true
+            if git cat-file -e "$BASELINE_SHA" 2>/dev/null; then
+              git checkout "$BASELINE_SHA"
+            else
+              echo "Baseline SHA not present locally; attempting to fetch by SHA from origin"
+              git fetch origin "$BASELINE_SHA":"refs/tmp/baseline" --quiet
+              git checkout "$BASELINE_SHA"
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Resolve versions from QA') {
+      steps {
+        script {
+          // Compute once and pass via env across stages
+          env.PING_TAG = sh(returnStdout: true, script: '''awk '/name: *daoquocquyen\\/ping/{f=1} f&&/newTag:/{print $2; exit}' gitops/ping/overlays/qa/kustomization.yaml''').trim()
+          env.PONG_TAG = sh(returnStdout: true, script: '''awk '/name: *daoquocquyen\\/pong/{f=1} f&&/newTag:/{print $2; exit}' gitops/pong/overlays/qa/kustomization.yaml''').trim()
+          env.PING_REF_WO_TAG = 'daoquocquyen/ping'
+          env.PONG_REF_WO_TAG = 'daoquocquyen/pong'
+          env.PING_REF = "${env.PING_REF_WO_TAG}:${env.PING_TAG}"
+          env.PONG_REF = "${env.PONG_REF_WO_TAG}:${env.PONG_TAG}"
+          env.PING_RELEASE = env.PING_TAG.contains('-') ? env.PING_TAG.split('-',2)[0] : env.PING_TAG
+          env.PONG_RELEASE = env.PONG_TAG.contains('-') ? env.PONG_TAG.split('-',2)[0] : env.PONG_TAG
+          echo "QA baseline: ping=${env.PING_TAG} (rel=${env.PING_RELEASE}), pong=${env.PONG_TAG} (rel=${env.PONG_RELEASE})"
+        }
+      }
+    }
+
+    stage('Create Prod branch + update overlays') {
+      steps {
+        dir('gitops') {
+          script { env.BRANCH_NAME = "promote/prod/${params.BASELINE_SHA.take(7)}-${new Date().format('yyyyMMddHHmmss')}" }
+          sh '''
+            set -eu
+            git checkout -B "$BRANCH_NAME"
+            # Update PROD kustomization newTag values using env-provided tags
+            sed -i '/name: *daoquocquyen\\/ping/{n;s|newTag:.*|newTag: '"$PING_TAG"'|}' ping/overlays/prod/kustomization.yaml
+            sed -i '/name: *daoquocquyen\\/pong/{n;s|newTag:.*|newTag: '"$PONG_TAG"'|}' pong/overlays/prod/kustomization.yaml
+            git status --porcelain
+            git config user.email "${GIT_USER_EMAIL:-jenkins-bot@localhost}"
+            git config user.name  "${GIT_USER_NAME:-Jenkins-bot}"
+            git add ping/overlays/prod/kustomization.yaml pong/overlays/prod/kustomization.yaml
+            git commit -m "promote(prod): ping->${PING_TAG}, pong->${PONG_TAG} from baseline ${BASELINE_SHA}"
+          '''
+        }
+      }
+    }
+
+    stage('Push branch + Open PR') {
+      steps {
+        dir('gitops') {
+          sh '''
+            set -eu
+            export GITHUB_TOKEN="$GH_TOKEN"
+            git remote set-url origin "https://jenkins-bot:${GH_TOKEN}@github.com/daoquocquyen/pingpong-gitops-config.git"
+            git push -u origin "$BRANCH_NAME"
+            SHORT_SHA=$(echo "$BASELINE_SHA" | cut -c1-7)
+            gh pr create \
+              --title "Promote to Prod: ping ${PING_RELEASE}, pong ${PONG_RELEASE} (${SHORT_SHA})" \
+              --body "Promote to Prod from QA baseline ${BASELINE_SHA}. Release tags: ping=${PING_RELEASE}, pong=${PONG_RELEASE}." \
+              --base main \
+              --head "$BRANCH_NAME"
+          '''
+        }
+      }
+    }
+
+    stage('Tag images with release tags') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+          sh '''
+            set -eu
+            docker login -u "$DH_USER" -p "$DH_PASS"
+            # Retag and push ping image with RELEASE_TAG
+            docker pull ${PING_REF}
+            docker tag ${PING_REF} "${PING_REF_WO_TAG}:${PING_RELEASE}"
+            docker push "${PING_REF_WO_TAG}:${PING_RELEASE}"
+
+            # Retag and push pong image with RELEASE_TAG
+            docker pull ${PONG_REF}
+            docker tag ${PONG_REF} "${PONG_REF_WO_TAG}:${PONG_RELEASE}"
+            docker push "${PONG_REF_WO_TAG}:${PONG_RELEASE}"
+          '''
+        }
+      }
+    }
+
+    stage('Tag source repos with release tags') {
+      steps {
+        dir('src-ping') {
+          sh '''
+            set -eu
+            git clone "$PING_REPO_URL" .
+            # Ensure git identity is set for CI commits
+            git config user.email "${GIT_USER_EMAIL:-jenkins-bot@localhost}"
+            git config user.name  "${GIT_USER_NAME:-Jenkins-bot}"
+            git fetch --all --tags --quiet
+            git tag -a "$PING_RELEASE" -m "Release $PING_RELEASE" || true
+            git remote set-url origin "https://jenkins-bot:${GH_TOKEN}@${PING_REPO_URL#https://}"
+            git push origin "$PING_RELEASE" || true
+          '''
+        }
+        dir('src-pong') {
+          sh '''
+            set -eu
+            git clone "$PONG_REPO_URL" .
+            # Ensure git identity is set for CI commits
+            git config user.email "${GIT_USER_EMAIL:-jenkins-bot@localhost}"
+            git config user.name  "${GIT_USER_NAME:-Jenkins-bot}"
+            git fetch --all --tags --quiet
+            git tag -a "$PONG_RELEASE" -m "Release $PONG_RELEASE" || true
+            git remote set-url origin "https://jenkins-bot:${GH_TOKEN}@${PONG_REPO_URL#https://}"
+            git push origin "$PONG_RELEASE" || true
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo 'Promotion PR for Prod created.' }
+    failure { echo 'Promotion to Prod failed.' }
+  }
+}

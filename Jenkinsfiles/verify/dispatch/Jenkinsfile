@@ -1,0 +1,74 @@
+pipeline {
+  agent any
+  options { disableConcurrentBuilds(); }
+
+  triggers {
+    GenericTrigger(
+      genericVariables: [
+        [key: 'REF', value: '$.ref', defaultValue: ''],
+        [key: 'BEFORE', value: '$.before', defaultValue: ''],
+        [key: 'AFTER', value: '$.after', defaultValue: ''],
+        [key: 'REPO_URL', value: '$.repository.clone_url', defaultValue: '']
+      ],
+      token: 'pingpong-cd-tests',
+      printContributedVariables: true,
+      printPostContent: false,
+      silentResponse: true
+    )
+  }
+
+  stages {
+    stage('Validate event') {
+      steps {
+        script {
+          if (!(env.REPO_URL ?: '').contains('pingpong-gitops-config') || env.REF != 'refs/heads/main') {
+            echo 'Ignore: not gitops main push'
+            currentBuild.result = 'NOT_BUILT'
+          }
+        }
+      }
+    }
+
+    stage('Checkout AFTER') {
+      when { expression { return currentBuild.result == null } }
+      steps {
+        dir('gitops') {
+          checkout([$class: 'GitSCM', branches: [[name: '*/main']], userRemoteConfigs: [[ url: env.REPO_URL ]]])
+          sh '''
+            git fetch --all --quiet
+            if ! git cat-file -e "$AFTER" 2>/dev/null; then
+              git fetch origin "$AFTER":"refs/tmp/after" --quiet || true
+            fi
+            git checkout "$AFTER"
+          '''
+        }
+      }
+    }
+
+    stage('Detect envs and dispatch') {
+      when { expression { return currentBuild.result == null } }
+      steps {
+        script {
+          def diff = sh(returnStdout: true, script: "cd gitops && git diff --name-only ${env.BEFORE} ${env.AFTER} || true").trim()
+          def files = diff ? diff.split('\\n') as List : []
+          def targets = [] as Set
+          files.each { p ->
+            if (p =~ /\/overlays\/dev\//)  targets << 'dev'
+            if (p =~ /\/overlays\/qa\//)   targets << 'qa'
+            if (p =~ /\/overlays\/prod\//) targets << 'prod'
+          }
+          echo "Changed overlays: ${targets ?: 'none'}"
+          def builds = [:]
+          targets.each { envName ->
+            def jobName = envName == 'dev' ? 'pingpong-verify-dev' : (envName == 'qa' ? 'pingpong-verify-qa' : 'pingpong-verify-prod')
+            builds["dispatch-${envName}"] = {
+              build job: jobName, propagate: false, wait: false,
+                    parameters: [ string(name: 'BASELINE_SHA', value: env.AFTER) ]
+            }
+          }
+          if (builds) { parallel builds } else { echo 'No env overlays changed; nothing to dispatch.' }
+        }
+      }
+    }
+  }
+}
