@@ -105,3 +105,12 @@ sequenceDiagram
 
 - GitOps config: https://github.com/daoquocquyen/pingpong-gitops-config
 - Local infra (Jenkins, Argo CD, k3d, ngrok): https://github.com/daoquocquyen/simple-cd-demo-infra
+
+## Repository Overview
+
+This project is organized into several repositories, each serving a specific purpose:
+
+- **ping**: Contains the source code and resources for the `app ping` service.
+- **pong**: Contains the source code and resources for the `app pong` service.
+- **pingpong-cicd**: Manages CI/CD pipelines and automation for the Ping Pong applications, ensuring streamlined build and deployment processes.
+- **pingpong-gitops-config**: Stores GitOps configuration files, which are synchronized and managed by ArgoCD for automated and declarative application delivery.
